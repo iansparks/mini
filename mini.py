@@ -1,88 +1,197 @@
-import operator as op
-
 from parsimonious.grammar import Grammar
+import ast
 
 
 class Mini(object):
-
     def __init__(self, env={}):
-        env['sum'] = lambda *args: sum(args)
         self.env = env
+        # Add built-in functions
+        self.env['sum'] = lambda *args: sum(args)
+        self.text = ''
 
-    def parse(self, source):
+    def __line(self, node):
+        """Return the 1-based line number"""
+        return self.text.count('\n', 0, node.start) + 1
+
+    def __column(self, node):
+        """Return the 1-based column"""
+        try:
+            return node.start - self.text.rindex('\n', 0, node.start)
+        except ValueError:
+            return node.start + 1
+
+    def parse(self, source, grammar_rule="program"):
+        # Extract grammar rules from doc strings
         grammar = '\n'.join(v.__doc__ for k, v in vars(self.__class__).items()
-                      if '__' not in k and hasattr(v, '__doc__') and v.__doc__)
-        return Grammar(grammar)['program'].parse(source)
+                            if '__' not in k and hasattr(v, '__doc__') and v.__doc__)
+        return Grammar(grammar)[grammar_rule].parse(source)
+
+    def _eval(self, node):
+        method = getattr(self, node.expr_name, lambda node, children: children)
+        return method(node, [self._eval(n) for n in node])
+
+    def compile(self, source):
+        # Compile an expression
+        parsed = self.get_ast(source, 'program')
+        fixed = ast.fix_missing_locations(parsed)
+        codeobj = compile(fixed, '<string>', 'exec')
+        eval(codeobj, self.env)
 
     def eval(self, source):
-        node = self.parse(source) if isinstance(source, str) else source
-        method = getattr(self, node.expr_name, lambda node, children: children)
-        if node.expr_name in ['ifelse', 'func']:
-            return method(node)
-        return method(node, [self.eval(n) for n in node])
+        # Evaluate an expression
+        parsed = self.get_ast(source, 'expressions')
+        fixed = ast.fix_missing_locations(parsed)
+        codeobj = compile(fixed, '<string>', 'eval')
+        return eval(codeobj, self.env)
+
+    def get_ast(self, source, grammar_rule):
+        self.text = source
+        node = self.parse(source, grammar_rule)
+        return self._eval(node)
+
+    # --------------------------------------------------------------------------------------------------------
+    # Grammar methods
+    #
 
     def program(self, node, children):
-        'program = expr*'
-        return children
+        'program = statement+'
+        return ast.Module(body=children,
+                          lineno=self.__line(node),
+                          col_offset=self.__column(node)
+                          )
 
-    def expr(self, node, children):
-        'expr = _ (func / ifelse / call / infix / assignment / number / name) _'
+    def statement(self, node, children):
+        'statement = _ (func / assignment) _'
         return children[1][0]
 
-    def func(self, node):
-        'func = "(" parameters ")" _ "->" expr'
-        _, params, _, _, _, expr = node
-        params = map(self.eval, params)
-        def func(*args):
-            env = dict(self.env.items() + zip(params, args))
-            return Mini(env).eval(expr)
-        return func
+    def expressions(self, node, children):
+        'expressions = expr*'
+        exp = ast.Expression(
+                ast.List(
+                        elts=children,
+                        ctx=ast.Load(),
+                        lineno=self.__line(node),
+                        col_offset=self.__column(node)
+                )
+        )
+        return exp
+
+    def func(self, node, children):
+        'func = name _ "=" _ "(" parameters ")" _ "->" _ expr'
+        name, _, _equals, _, lbrace, params, rbrace, _, _arrow, _, expr = children
+
+        # Name will return us an AST node called name, we just need it's name
+        name = name.id
+
+        funcdef = ast.FunctionDef(name=name,
+                                  args=ast.arguments(
+                                          args=params,
+                                          vararg=None, kwarg=None, defaults=[],
+                                          lineno=self.__line(node),
+                                          col_offset=self.__column(node)
+
+                                  ),
+                                  body=[ast.Return(value=expr,
+                                                   lineno=expr.lineno,
+                                                   col_offset=expr.col_offset
+                                                   )],
+                                  decorator_list=[],
+                                  lineno=self.__line(node),
+                                  col_offset=self.__column(node)
+                                  )
+        return funcdef
 
     def parameters(self, node, children):
-        'parameters = lvalue*'
+        'parameters = parameter*'
         return children
 
-    def ifelse(self, node):
-        'ifelse = "if" expr "then" expr "else" expr'
-        _, cond, _, cons, _, alt = node
-        return self.eval(cons) if self.eval(cond) else self.eval(alt)
+    def parameter(self, node, children):
+        'parameter = ~"[a-z]+" _ '
+        return ast.Name(id=node.text.strip(),
+                        ctx=ast.Param(),
+                        lineno=self.__line(node),
+                        col_offset=self.__column(node)
+                        )
+
+    def expr(self, node, children):
+        'expr = _ (ifelse / call / infix / number / name) _'
+        return children[1][0]
+
+    def ifelse(self, node, children):
+        'ifelse = "if" _ expr _ "then" _ expr _ "else" _ expr'
+        _if, _, cond, _, _then, _, cons, _, _else, _, alt = children
+        return ast.IfExp(test=cond, body=cons, orelse=alt,
+                         lineno=self.__line(node),
+                         col_offset=self.__column(node)
+                         )
 
     def call(self, node, children):
         'call = name "(" arguments ")"'
-        name, _, arguments, _ = children
-        return name(*arguments)
+        name, lbrace, args, rbrace = children
+
+        return ast.Call(
+                func=name,
+                args=args,
+                keywords=[],
+                lineno=self.__line(node),
+                col_offset=self.__column(node)
+        )
 
     def arguments(self, node, children):
-        'arguments = expr*'
+        'arguments = argument*'
         return children
 
+    def argument(self, node, children):
+        'argument = expr _'
+        return children[0]
+
     def infix(self, node, children):
-        'infix = "(" expr operator expr ")"'
-        _, expr1, operator, expr2, _ = children
-        return operator(expr1, expr2)
+        'infix = "(" _ expr _ operator _ expr _ ")"'
+        _lbrace, _, expr1, _, op, _, expr2, _, rbrace = children
+        return ast.BinOp(
+                expr1,
+                op,
+                expr2,
+                lineno=self.__line(node),
+                col_offset=self.__column(node)
+        )
 
     def operator(self, node, children):
         'operator = "+" / "-" / "*" / "/"'
-        operators = {'+': op.add, '-': op.sub, '*': op.mul, '/': op.div}
-        return operators[node.text]
-
-    def assignment(self, node, children):
-        'assignment = lvalue "=" expr'
-        lvalue, _, expr = children
-        self.env[lvalue] = expr
-        return expr
-
-    def lvalue(self, node, children):
-        'lvalue = ~"[a-z]+" _'
-        return node.text.strip()
-
-    def name(self, node, children):
-        'name = ~"[a-z]+" _'
-        return self.env.get(node.text.strip(), -1)
+        operators = {"+": ast.Add, "-": ast.Sub, "*": ast.Mult, "/": ast.Div}
+        return operators[node.text.strip()](lineno=self.__line(node), col_offset=self.__column(node))
 
     def number(self, node, children):
         'number = ~"[0-9]+"'
-        return int(node.text)
+        return ast.Num(int(node.text),
+                       lineno=self.__line(node),
+                       col_offset=self.__column(node)
+                       )
+
+    def name(self, node, children):
+        'name = ~"[a-z]+" _ '
+        return ast.Name(id=node.text.strip(),
+                        ctx=ast.Load(),
+                        lineno=self.__line(node),
+                        col_offset=self.__column(node)
+                        )
+
+    def assignment(self, node, children):
+        'assignment = lvalue _ "=" _ expr'
+        lvalue, _, equals, _, expr = children
+        return ast.Assign(targets=[lvalue],
+                          value=expr,
+                          lineno=self.__line(node),
+                          col_offset=self.__column(node)
+                          )
+
+    def lvalue(self, node, children):
+        'lvalue = ~"[a-z]+" _ '
+        return ast.Name(id=node.text.strip(),
+                        ctx=ast.Store(),
+                        lineno=self.__line(node),
+                        col_offset=self.__column(node)
+                        )
 
     def _(self, node, children):
         '_ = ~"\s*"'
